@@ -5,7 +5,7 @@ import time
 import numpy as np
 import serial
 import sounddevice as sd
-from pylsl import StreamInfo, StreamOutlet
+from pylsl import StreamInfo, StreamOutlet, local_clock
 
 SAMPLE_RATE = 905
 DEFAULT_THRESHOLD = 60
@@ -25,6 +25,9 @@ _t = np.linspace(0, TONE_DURATION_S, _n, endpoint=False)
 TONE_BUFFER = np.sin(2 * np.pi * TONE_FREQ * _t).astype(np.float32)
 TONE_BUFFER[:_nf] *= np.linspace(0.0, 1.0, _nf, dtype=np.float32)
 TONE_BUFFER[-_nf:] *= np.linspace(1.0, 0.0, _nf, dtype=np.float32)
+
+
+t_shared = local_clock()
 
 
 fsr_outlet = StreamOutlet(
@@ -58,7 +61,7 @@ def _audio_callback(outdata, frames, time_info, status):
             return
 
         if not _tone_started:
-            marker_outlet.push_sample(["tone_start"])
+            # marker_outlet.push_sample(["tone_start"])
             _tone_started = True
 
         end = _tone_pos + frames
@@ -68,7 +71,7 @@ def _audio_callback(outdata, frames, time_info, status):
             outdata[chunk:] = 0
             _tone_pos = -1
             _tone_started = False
-            marker_outlet.push_sample(["tone_ended"])
+            # marker_outlet.push_sample(["tone_ended"])
         else:
             _tone_pos = end
 
@@ -90,7 +93,7 @@ def trigger_tone():
         _tone_pos = 0
 
 
-armed = False
+armed = True
 
 
 def read_serial():
@@ -106,22 +109,23 @@ def read_serial():
             if len(parts) != 3:
                 continue
 
-            try:
-                packet_type, _, value_str = parts
-                # artuino_ts = int(arduino_ts_str)
-                value = float(value_str)
-            except ValueError:
-                continue
+            # try:
+            packet_type, _, value_str = parts
+            # artuino_ts = int(arduino_ts_str)
+            value = float(value_str)
+            # except ValueError:
+            #     continue
+
+            print(value)
 
             if packet_type == "P":
-                fsr_outlet.push_sample([value])
+                fsr_outlet.push_sample([value], t_shared)
             else:
-                marker_outlet.push_sample(["sound_" + packet_type])
+                marker_outlet.push_sample(["sound_" + packet_type], t_shared)
 
             if armed and value >= DEFAULT_THRESHOLD:
                 marker_outlet.push_sample(["press_start"])
                 trigger_tone()
-                marker_outlet.push_sample(["triggered_tone"])
                 armed = False
 
             if not armed and value < DEFAULT_THRESHOLD:
