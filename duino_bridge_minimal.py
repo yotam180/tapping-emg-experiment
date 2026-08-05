@@ -126,3 +126,15 @@ def read_serial():
 
             if not armed and value < DEFAULT_THRESHOLD:
                 armed = True
+
+
+serial_thread = threading.Thread(target=read_serial, daemon=True)
+serial_thread.start()
+
+try:
+    while True:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    _audio_stream.stop()
+    _audio_stream.close()
+    print("\nStopped.")
