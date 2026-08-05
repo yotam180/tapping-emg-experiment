@@ -119,9 +119,9 @@ def read_serial():
                 marker_outlet.push_sample(["sound_" + packet_type])
 
             if armed and value >= DEFAULT_THRESHOLD:
-                marker_outlet.push_sample("press_start")
+                marker_outlet.push_sample(["press_start"])
                 trigger_tone()
-                marker_outlet.push_sample("triggered_tone")
+                marker_outlet.push_sample(["triggered_tone"])
                 armed = False
 
             if not armed and value < DEFAULT_THRESHOLD:
