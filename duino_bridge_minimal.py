@@ -27,11 +27,31 @@ TONE_BUFFER[:_nf] *= np.linspace(0.0, 1.0, _nf, dtype=np.float32)
 TONE_BUFFER[-_nf:] *= np.linspace(1.0, 0.0, _nf, dtype=np.float32)
 
 
+def _synced_info(name, stype, n_channels, srate, fmt, source_id):
+    """StreamInfo declaring that every sample carries an explicit timestamp.
+
+    Without this block MNELAB's read_native_xdf() routes the stream through its
+    "legacy robust measured-clock segments" recovery, which rewrote our FSR
+    timeline by up to 150 ms while leaving the marker stream on raw timestamps —
+    making markers appear a few samples behind the force trace. Declaring the
+    same v2 metadata the Xtrodes outlets use marks our per-sample local_clock()
+    timestamps as authoritative, so no correction is applied.
+    """
+    info = StreamInfo(name, stype, n_channels, srate, fmt, source_id)
+    sync = info.desc().append_child("synchronization")
+    sync.append_child_value("timestamp_model_version", "2")
+    sync.append_child_value("timestamp_semantics", "explicit_per_sample")
+    sync.append_child_value(
+        "timestamp_interpolation", "uniform_between_buffer_endpoints"
+    )
+    return info
+
+
 fsr_outlet = StreamOutlet(
-    StreamInfo("FSR_force", "FSR", 1, IRREGULAR_RATE, "float32", "fsr_arduino")
+    _synced_info("FSR_force", "FSR", 1, IRREGULAR_RATE, "float32", "fsr_arduino")
 )
 marker_outlet = StreamOutlet(
-    StreamInfo("Markers", "Markers", 1, IRREGULAR_RATE, "string", "arduino_bridge")
+    _synced_info("Markers", "Markers", 1, IRREGULAR_RATE, "string", "arduino_bridge")
 )
 
 
@@ -122,7 +142,6 @@ def read_serial():
             line = ser.readline().decode("utf-8", errors="replace").strip()
             if not line:
                 continue
-
             parts = line.split(",")
             if len(parts) != 3:
                 continue
@@ -130,24 +149,25 @@ def read_serial():
             # try:
             packet_type, _, value_str = parts
             # artuino_ts = int(arduino_ts_str)
-            value = float(value_str)
             # except ValueError:
             #     continue
-
-            print(value)
-            t_shared = local_clock()
+            value = 0.0
+            # print(value)
             if packet_type == "P":
+                value = float(value_str)
+                t_shared = local_clock()
                 fsr_outlet.push_sample([value], t_shared)
+                if armed and value >= DEFAULT_THRESHOLD:
+                    marker_outlet.push_sample(["press_start "+str(value)], t_shared)
+                    trigger_tone()
+                    armed = False
+
+                if not armed and value < DEFAULT_THRESHOLD:
+                    armed = True
             else:
                 marker_outlet.push_sample(["sound_" + packet_type], t_shared)
 
-            if armed and value >= DEFAULT_THRESHOLD:
-                marker_outlet.push_sample(["press_start "+str(value)], t_shared)
-                trigger_tone()
-                armed = False
 
-            if not armed and value < DEFAULT_THRESHOLD:
-                armed = True
 
 
 serial_thread = threading.Thread(target=read_serial, daemon=True)
