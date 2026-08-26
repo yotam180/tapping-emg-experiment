@@ -5,9 +5,9 @@ import time
 import numpy as np
 import serial
 import sounddevice as sd
-from pylsl import StreamInfo, StreamOutlet, local_clock
+from pylsl import StreamInfo, StreamOutlet, local_clock,IRREGULAR_RATE
 
-SAMPLE_RATE = 905
+SAMPLE_RATE = 830
 DEFAULT_THRESHOLD = 60
 RELEASE_RATIO = 0.5
 
@@ -27,14 +27,11 @@ TONE_BUFFER[:_nf] *= np.linspace(0.0, 1.0, _nf, dtype=np.float32)
 TONE_BUFFER[-_nf:] *= np.linspace(1.0, 0.0, _nf, dtype=np.float32)
 
 
-t_shared = local_clock()
-
-
 fsr_outlet = StreamOutlet(
-    StreamInfo("FSR_force", "FSR", 1, SAMPLE_RATE, "float32", "fsr_arduino")
+    StreamInfo("FSR_force", "FSR", 1, IRREGULAR_RATE, "float32", "fsr_arduino")
 )
 marker_outlet = StreamOutlet(
-    StreamInfo("Markers", "Markers", 1, 0, "string", "arduino_bridge")
+    StreamInfo("Markers", "Markers", 1, IRREGULAR_RATE, "string", "arduino_bridge")
 )
 
 
@@ -117,14 +114,14 @@ def read_serial():
             #     continue
 
             print(value)
-
+            t_shared = local_clock()
             if packet_type == "P":
                 fsr_outlet.push_sample([value], t_shared)
             else:
                 marker_outlet.push_sample(["sound_" + packet_type], t_shared)
 
             if armed and value >= DEFAULT_THRESHOLD:
-                marker_outlet.push_sample(["press_start"])
+                marker_outlet.push_sample(["press_start "+str(value)], t_shared)
                 trigger_tone()
                 armed = False
 
