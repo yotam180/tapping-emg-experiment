@@ -73,13 +73,34 @@ def _audio_callback(outdata, frames, time_info, status):
             _tone_pos = end
 
 
-_audio_stream = sd.OutputStream(
+def _find_wasapi_device():
+    """Return (device_index, WasapiSettings) for exclusive mode, or (None, None)."""
+    for i, api in enumerate(sd.query_hostapis()):
+        if "WASAPI" in api["name"]:
+            dev = api["default_output_device"]
+            if dev >= 0:
+                return dev, sd.WasapiSettings(exclusive=True)
+    return None, None
+
+
+_wasapi_dev, _wasapi_extra = _find_wasapi_device()
+
+_stream_kwargs = dict(
     samplerate=AUDIO_SAMPLE_RATE,
     channels=1,
     dtype="float32",
+    blocksize=64,
     latency="low",
     callback=_audio_callback,
 )
+if _wasapi_dev is not None:
+    _stream_kwargs["device"] = _wasapi_dev
+    _stream_kwargs["extra_settings"] = _wasapi_extra
+    print(f"Using WASAPI exclusive mode (device {_wasapi_dev})")
+else:
+    print("WASAPI not available, falling back to default device")
+
+_audio_stream = sd.OutputStream(**_stream_kwargs)
 _audio_stream.start()
 
 
