@@ -2,29 +2,25 @@ import argparse
 import threading
 import time
 
-import numpy as np
 import serial
-import sounddevice as sd
-from pylsl import StreamInfo, StreamOutlet, local_clock,IRREGULAR_RATE
+from psychopy import prefs
+
+prefs.hardware["audioLib"] = ["ptb"]
+from psychopy import sound
+from pylsl import IRREGULAR_RATE, StreamInfo, StreamOutlet, local_clock
 
 SAMPLE_RATE = 830
-DEFAULT_THRESHOLD = 60
+DEFAULT_THRESHOLD = 40
 RELEASE_RATIO = 0.5
 
-AUDIO_SAMPLE_RATE = 44100
 TONE_FREQ = 440
 TONE_DURATION_S = 0.050
-FADE_DURATION_S = 0.005
 
 BAUD_RATE = 115200
 
-# Pre-generate tone buffer
-_n = int(AUDIO_SAMPLE_RATE * TONE_DURATION_S)
-_nf = int(AUDIO_SAMPLE_RATE * FADE_DURATION_S)
-_t = np.linspace(0, TONE_DURATION_S, _n, endpoint=False)
-TONE_BUFFER = np.sin(2 * np.pi * TONE_FREQ * _t).astype(np.float32)
-TONE_BUFFER[:_nf] *= np.linspace(0.0, 1.0, _nf, dtype=np.float32)
-TONE_BUFFER[-_nf:] *= np.linspace(1.0, 0.0, _nf, dtype=np.float32)
+stimulus_sound = sound.Sound(
+    value=TONE_FREQ, secs=TONE_DURATION_S, stereo=True, hamming=True, name="stim"
+)
 
 
 def _synced_info(name, stype, n_channels, srate, fmt, source_id):
@@ -61,81 +57,13 @@ parser.add_argument("port")
 args = parser.parse_args()
 
 
-# Audio: persistent stream, callback-driven
-# _tone_pos == -1  → idle (output silence)
-# _tone_pos >= 0   → playing from that sample index
-_tone_pos = -1
-_tone_lock = threading.Lock()
-
-_tone_started = False
-
-
-def _audio_callback(outdata, frames, time_info, status):
-    global _tone_pos, _tone_started
-    with _tone_lock:
-        if _tone_pos < 0:
-            outdata.fill(0)
-            return
-
-        if not _tone_started:
-            # marker_outlet.push_sample(["tone_start"])
-            _tone_started = True
-
-        end = _tone_pos + frames
-        chunk = min(end, len(TONE_BUFFER)) - _tone_pos
-        outdata[:chunk, 0] = TONE_BUFFER[_tone_pos : _tone_pos + chunk]
-        if chunk < frames:
-            outdata[chunk:] = 0
-            _tone_pos = -1
-            _tone_started = False
-            # marker_outlet.push_sample(["tone_ended"])
-        else:
-            _tone_pos = end
-
-
-def _find_wasapi_device():
-    """Return (device_index, WasapiSettings) for exclusive mode, or (None, None)."""
-    for i, api in enumerate(sd.query_hostapis()):
-        if "WASAPI" in api["name"]:
-            dev = api["default_output_device"]
-            if dev >= 0:
-                return dev, sd.WasapiSettings(exclusive=True)
-    return None, None
-
-
-_wasapi_dev, _wasapi_extra = _find_wasapi_device()
-
-_stream_kwargs = dict(
-    samplerate=AUDIO_SAMPLE_RATE,
-    channels=1,
-    dtype="float32",
-    blocksize=64,
-    latency="low",
-    callback=_audio_callback,
-)
-if _wasapi_dev is not None:
-    _stream_kwargs["device"] = _wasapi_dev
-    _stream_kwargs["extra_settings"] = _wasapi_extra
-    print(f"Using WASAPI exclusive mode (device {_wasapi_dev})")
-else:
-    print("WASAPI not available, falling back to default device")
-
-_audio_stream = sd.OutputStream(**_stream_kwargs)
-_audio_stream.start()
-
-
-def trigger_tone():
-    """Called from serial thread — must never block."""
-    global _tone_pos
-    with _tone_lock:
-        _tone_pos = 0
-
-
 armed = True
+min_time_to_below = 0
+min_time_to_rest = 0
 
 
 def read_serial():
-    global armed
+    global armed, min_time_to_rest, min_time_to_below
 
     with serial.Serial(args.port, BAUD_RATE, timeout=1) as ser:
         while True:
@@ -169,7 +97,6 @@ def read_serial():
 
 
 
-
 serial_thread = threading.Thread(target=read_serial, daemon=True)
 serial_thread.start()
 
@@ -177,6 +104,4 @@ try:
     while True:
         time.sleep(0.1)
 except KeyboardInterrupt:
-    _audio_stream.stop()
-    _audio_stream.close()
     print("\nStopped.")
