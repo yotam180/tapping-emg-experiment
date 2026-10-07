@@ -30,19 +30,38 @@ played directly from the serial-reader thread the instant the press threshold is
 crossed to keep press->sound latency minimal.
 
 Usage:
+    python main.py experiment 3 [--port COM3] [--audio-device NAME]
+        Run the full experiment for participant 3 (data/003/exp.json). Creates
+        the participant (randomising the cue map) on first launch, resumes from
+        where it left off otherwise, and gates between runs behind a 3 s FSR
+        hold. trials-per-run and runs-per-task default to 60 and 5.
+
     python main.py block [--port COM3] [--trials 60] [--modality identity]
-                         [--threshold 40]
+        Run a single standalone block (no data files).
+
+    python main.py audio-devices | test-audio | preview-cues
+        Utilities for checking the audio output and cue shapes.
 
 Quit any time with Q or Escape.
 """
 
 import argparse
+import json
 import math
+import os
+import platform
 import random
+import shutil
+import socket
+import subprocess
+import sys
+import traceback
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
+from pathlib import Path
 
 import serial
 from psychopy import prefs
@@ -77,9 +96,31 @@ TONE_DURATION_S = 0.050
 
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
+PROGRESS_COLOR = (30, 160, 60)  # Fill colour of the hold-to-continue wedge
 SYMBOL_HALF = 80  # Circumradius of cue symbols (px) — matched across shapes
 FIX_HALF = 20  # Half-size of the fixation cross (px)
 STAR_INNER_RATIO = 0.6  # Star inner/outer radius: higher -> chubbier, less pointy
+HOLD_RADIUS = 55  # Radius of the hold-to-continue fill circle (px)
+
+# ── Experiment / persistence ────────────────────────────────────────────────
+
+SCHEMA_VERSION = 1
+SOFTWARE_VERSION = "0.1"
+DATA_ROOT = Path(__file__).parent / "data"
+EXP_FILENAME = "exp.json"
+
+DEFAULT_RUNS_PER_TASK = 5
+DEFAULT_TRIALS_PER_RUN = 60
+TASK_ORDER = ["identity", "intensity"]  # TODO: counterbalance once intensity lands
+
+HOLD_SECONDS = 1.5  # Continuous FSR press needed to advance (hold-to-continue)
+HOLD_PROMPT = "Press and hold the surface to continue."
+END_OF_RUN_PAUSE_S = 1.0  # Blank pause after a run, before the break screen
+BETWEEN_RUN_LINES = ["Take a short break."]
+
+# LSL source ids — stored per session so recordings can be matched to sessions.
+SOURCE_ID_FSR = "fsr_arduino"
+SOURCE_ID_MARKERS = "arduino_bridge"
 
 
 class Condition(Enum):
@@ -187,22 +228,37 @@ def format_cue_map(cue_map: dict[Condition, Shape]) -> str:
     )
 
 
+def cue_map_to_dict(cue_map: dict[Condition, Shape]) -> dict[str, str]:
+    """{'PL': 'diamond', ...} for JSON storage."""
+    return {c.value: cue_map[c].value for c in (Condition.PL, Condition.PH, Condition.MIX)}
+
+
+def cue_map_from_dict(data: dict[str, str]) -> dict[Condition, Shape]:
+    return {Condition(c): Shape(s) for c, s in data.items()}
+
+
 # ── Audio ──────────────────────────────────────────────────────────────────────
+
+
+def _output_devices() -> list[dict]:
+    """PTB output devices (with >0 output channels), empty list if unavailable."""
+    try:
+        import psychtoolbox.audio as ptb_audio
+
+        return [d for d in ptb_audio.get_devices() if d["NrOutputChannels"] > 0]
+    except Exception as exc:
+        print(f"(psychtoolbox enumeration failed: {exc}; using PsychoPy)")
+        try:
+            from psychopy.sound.backend_ptb import getDevices
+
+            return list(getDevices(kind="output").values())
+        except Exception:
+            return []
 
 
 def list_audio_devices() -> int:
     """Print the PTB output devices so a name can be passed to --audio-device."""
-    try:
-        import psychtoolbox.audio as ptb_audio
-
-        devices = [d for d in ptb_audio.get_devices() if d["NrOutputChannels"] > 0]
-    except Exception as exc:  # Fall back to PsychoPy's own enumeration.
-        print(f"(psychtoolbox enumeration failed: {exc}; using PsychoPy)")
-        from psychopy.sound.backend_ptb import getDevices
-
-        devices = list(getDevices(kind="output").values())
-
-    for d in devices:
+    for d in _output_devices():
         print(
             f"  {d['DeviceName']!r}  "
             f"({int(d['NrOutputChannels'])} out, {d.get('HostAudioAPIName', '?')})"
@@ -219,11 +275,20 @@ class AudioEngine:
                 f"modality {modality.value!r} not supported yet (only 'identity')"
             )
         # Select the output device before the first Sound opens the PTB stream.
-        # PsychoPy matches the device name exactly (see 'audio-devices' for the
-        # exact strings); duplicate names across host APIs are resolved by PTB's
-        # latency preference, normally favouring the low-latency WASAPI entry.
+        # PsychoPy matches the device name exactly. If the requested name isn't
+        # in the enumeration, don't set it (an unmatched name yields silence) —
+        # warn and fall back to the system default instead.
         if device:
-            prefs.hardware["audioDevice"] = device
+            names = [d["DeviceName"] for d in _output_devices()]
+            if names and device not in names:
+                print(
+                    f"[audio] WARNING: device {device!r} not found; using system "
+                    f"default. Run 'audio-devices' for the exact names."
+                )
+            else:
+                prefs.hardware["audioDevice"] = device
+        selected = prefs.hardware.get("audioDevice") or "(system default)"
+        print(f"[audio] output device: {selected}")
         self._tones = {
             Tone.LOW: sound.Sound(
                 value=TONE_FREQ_LOW,
@@ -276,6 +341,7 @@ class SerialReader(threading.Thread):
         self.press_event = threading.Event()
         self.press_info: PressInfo | None = None
         self.error: Exception | None = None
+        self.current_force = 0.0  # Latest FSR sample, for the hold-to-continue gate
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -314,6 +380,7 @@ class SerialReader(threading.Thread):
 
                     t = local_clock()
                     if packet_type == "P":
+                        self.current_force = value
                         self.fsr_outlet.push_sample([value], t)
                         self._detect_press(value, t)
                     else:
@@ -364,6 +431,19 @@ def _star_points(
     return verts
 
 
+def _pie_points(
+    cx: float, cy: float, r: float, progress: float
+) -> list[tuple[float, float]]:
+    """Polygon of a wedge filling clockwise from 12 o'clock by ``progress`` 0..1."""
+    sweep = 360.0 * max(0.0, min(1.0, progress))
+    steps = max(2, int(sweep // 3) + 1)
+    pts = [(cx, cy)]
+    for i in range(steps + 1):
+        a = math.radians(sweep * i / steps)
+        pts.append((cx + r * math.sin(a), cy - r * math.cos(a)))
+    return pts
+
+
 def _shape_points(
     shape: Shape, cx: float, cy: float, s: float
 ) -> list[tuple[float, float]]:
@@ -382,6 +462,7 @@ class Display:
         self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
         pygame.mouse.set_visible(False)
         self.w, self.h = self.screen.get_size()
+        self.font = pygame.font.SysFont(None, 42)
         self.quit = False
         self.show_fixation()
 
@@ -421,6 +502,51 @@ class Display:
         pygame.draw.polygon(self.screen, SHAPE_COLORS[shape], points)
         pygame.display.flip()
 
+    def _blit_block(self, lines: list[str], cx: int, center_y: int) -> None:
+        """Blit a block of centred text lines, vertically centred on ``center_y``."""
+        line_h = self.font.get_linesize()
+        top = center_y - (len(lines) - 1) * line_h // 2
+        for i, text in enumerate(lines):
+            if not text:
+                continue
+            surf = self.font.render(text, True, BLACK)
+            rect = surf.get_rect(center=(cx, top + i * line_h))
+            self.screen.blit(surf, rect)
+
+    def show_message(self, lines: list[str]) -> None:
+        cx, cy = self._center
+        self.screen.fill(WHITE)
+        self._blit_block(lines, cx, cy)
+        pygame.display.flip()
+
+    def show_hold_progress(
+        self, progress: float, lines: list[str], shape: Shape | None = None
+    ) -> None:
+        """Optional cue + message, a pie-filling wedge, and the hold prompt.
+
+        Layout top-to-bottom: cue shape (if any), message lines, the wedge that
+        fills clockwise with ``progress`` 0..1 (nothing shown until the press
+        begins), and HOLD_PROMPT beneath it.
+        """
+        cx, cy = self._center
+        self.screen.fill(WHITE)
+        if shape is not None:
+            pygame.draw.polygon(
+                self.screen, SHAPE_COLORS[shape],
+                _shape_points(shape, cx, cy - 240, SYMBOL_HALF),
+            )
+        self._blit_block(lines, cx, cy - 70)
+
+        circle_cy = cy + 130
+        if progress > 0:
+            pygame.draw.polygon(
+                self.screen, PROGRESS_COLOR, _pie_points(cx, circle_cy, HOLD_RADIUS, progress)
+            )
+
+        prompt = self.font.render(HOLD_PROMPT, True, BLACK)
+        self.screen.blit(prompt, prompt.get_rect(center=(cx, circle_cy + HOLD_RADIUS + 40)))
+        pygame.display.flip()
+
     def close(self) -> None:
         pygame.quit()
 
@@ -454,6 +580,49 @@ def wait_for_press(
     return None
 
 
+def wait_for_hold(
+    reader: SerialReader,
+    display: Display,
+    lines: list[str],
+    shape: Shape | None = None,
+    hold_s: float = HOLD_SECONDS,
+) -> bool:
+    """Block until the FSR is held above threshold continuously for ``hold_s``.
+
+    Drives the pie-filling animation: the wedge fills with the elapsed hold time
+    and resets to empty the moment the press is released. A press carried over
+    from the previous screen does not count — the finger must first be seen up
+    (below threshold) so filling only ever starts on a fresh press. Returns
+    False if the user quit instead.
+    """
+    hold_start: float | None = None
+    armed = False  # Becomes True once the finger has been released at least once.
+    while True:
+        display.pump()
+        if display.quit:
+            return False
+
+        now = time.perf_counter()
+        pressing = reader.current_force >= reader.threshold
+        if not armed:
+            armed = not pressing  # Wait for the carried-over press to be lifted.
+            hold_start = None
+            progress = 0.0
+        elif pressing:
+            if hold_start is None:
+                hold_start = now
+            held = now - hold_start
+            if held >= hold_s:
+                return True
+            progress = held / hold_s
+        else:
+            hold_start = None
+            progress = 0.0
+
+        display.show_hold_progress(progress, lines, shape)
+        time.sleep(0.005)
+
+
 # ── Block runner ──────────────────────────────────────────────────────────────
 
 
@@ -463,6 +632,92 @@ def classify_response(rt: float) -> str:
     if rt > RESPONSE_MAX_S:
         return "late"
     return "valid"
+
+
+@dataclass
+class TrialResult:
+    """What the participant actually saw and did on one trial."""
+
+    index: int
+    condition: Condition
+    tone: Tone  # Outcome played (low/high) — keeps MIX-low vs MIX-high distinct.
+    shape: Shape
+    cue_t: float
+    press_t: float | None
+    force: float | None
+    rt_s: float | None
+    result: str  # valid | early | late | timeout
+
+
+def trial_result_to_dict(tr: TrialResult) -> dict:
+    return {
+        "i": tr.index,
+        "condition": tr.condition.value,
+        "outcome": tr.tone.value,
+        "shape": tr.shape.value,
+        "cue_t_lsl": round(tr.cue_t, 6),
+        "press_t_lsl": round(tr.press_t, 6) if tr.press_t is not None else None,
+        "force": round(tr.force, 1) if tr.force is not None else None,
+        "rt_s": round(tr.rt_s, 4) if tr.rt_s is not None else None,
+        "result": tr.result,
+    }
+
+
+def present_trial(
+    index: int,
+    trial: Trial,
+    shape: Shape,
+    reader: SerialReader,
+    display: Display,
+    markers: StreamOutlet,
+) -> TrialResult | None:
+    """Run one trial (ITI -> cue -> wait for press). None if the user quit."""
+    # ── Inter-trial interval (fixation) ───────────────────────────────────────
+    display.show_fixation()
+    markers.push_sample([f"trial_start {index}"], local_clock())
+    if not wait(random.uniform(ITI_MIN_S, ITI_MAX_S), display):
+        return None
+
+    # ── Cue (300 ms) ──────────────────────────────────────────────────────────
+    display.show_cue(shape)
+    cue_t = local_clock()
+    markers.push_sample([f"cue {trial.condition.value}"], cue_t)
+    # Record the planned outcome so MIX trials are decodable downstream.
+    markers.push_sample([f"outcome {trial.tone.value}"], cue_t)
+    if not wait(CUE_DURATION_S, display):
+        return None
+
+    # ── Fixation + wait for press ─────────────────────────────────────────────
+    display.show_fixation()
+    markers.push_sample(["cue_offset"], local_clock())
+    reader.arm(trial.tone)
+    press = wait_for_press(reader, RESPONSE_TIMEOUT_S, display)
+    reader.disarm()
+
+    if display.quit:
+        return None
+
+    if press is None:
+        markers.push_sample([f"trial_timeout {index}"], local_clock())
+        return TrialResult(
+            index, trial.condition, trial.tone, shape, cue_t, None, None, None, "timeout"
+        )
+
+    rt = press.t - cue_t
+    return TrialResult(
+        index, trial.condition, trial.tone, shape, cue_t, press.t, press.force, rt,
+        classify_response(rt),
+    )
+
+
+def print_trial(tr: TrialResult, n: int) -> None:
+    if tr.result == "timeout":
+        print(f"  trial {tr.index:3d}/{n}: {tr.condition.value}/{tr.tone.value}  timeout")
+    else:
+        print(
+            f"  trial {tr.index:3d}/{n}: {tr.condition.value}/{tr.tone.value}  "
+            f"rt={tr.rt_s:.3f}s force={tr.force:.1f} [{tr.result}]"
+        )
 
 
 def run_block(
@@ -478,46 +733,10 @@ def run_block(
     markers.push_sample([f"cue_map {format_cue_map(cue_map)}"], local_clock())
 
     for i, trial in enumerate(trials, start=1):
-        # ── Inter-trial interval (fixation) ───────────────────────────────────
-        display.show_fixation()
-        markers.push_sample([f"trial_start {i}"], local_clock())
-        if not wait(random.uniform(ITI_MIN_S, ITI_MAX_S), display):
+        tr = present_trial(i, trial, cue_map[trial.condition], reader, display, markers)
+        if tr is None:  # user quit
             break
-
-        # ── Cue (300 ms) ──────────────────────────────────────────────────────
-        shape = cue_map[trial.condition]
-        display.show_cue(shape)
-        cue_t = local_clock()
-        markers.push_sample([f"cue {trial.condition.value}"], cue_t)
-        # Record the planned outcome so MIX trials are decodable downstream.
-        markers.push_sample([f"outcome {trial.tone.value}"], cue_t)
-        if not wait(CUE_DURATION_S, display):
-            break
-
-        # ── Fixation + wait for press ─────────────────────────────────────────
-        display.show_fixation()
-        markers.push_sample(["cue_offset"], local_clock())
-
-        reader.arm(trial.tone)
-        press = wait_for_press(reader, RESPONSE_TIMEOUT_S, display)
-        reader.disarm()
-
-        if display.quit:
-            break
-
-        if press is None:
-            markers.push_sample([f"trial_timeout {i}"], local_clock())
-            print(
-                f"  trial {i:3d}/{n}: {trial.condition.value}/{trial.tone.value}  timeout"
-            )
-            continue
-
-        rt = press.t - cue_t
-        outcome = classify_response(rt)
-        print(
-            f"  trial {i:3d}/{n}: {trial.condition.value}/{trial.tone.value}  "
-            f"rt={rt:.3f}s force={press.force:.1f} [{outcome}]"
-        )
+        print_trial(tr, n)
 
     markers.push_sample(["block_end"], local_clock())
     print("Block complete.")
@@ -528,12 +747,203 @@ def run_block(
 
 def create_outlets() -> tuple[StreamOutlet, StreamOutlet]:
     fsr = StreamOutlet(
-        StreamInfo("FSR_force", "FSR", 1, SAMPLE_RATE, "float32", "fsr_arduino")
+        StreamInfo("FSR_force", "FSR", 1, SAMPLE_RATE, "float32", SOURCE_ID_FSR)
     )
     markers = StreamOutlet(
-        StreamInfo("Markers", "Markers", 1, IRREGULAR_RATE, "string", "arduino_bridge")
+        StreamInfo("Markers", "Markers", 1, IRREGULAR_RATE, "string", SOURCE_ID_MARKERS)
     )
     return fsr, markers
+
+
+# ── Persistence (exp.json) ─────────────────────────────────────────────────────
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _git_commit() -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def config_snapshot(threshold: float) -> dict:
+    """Timing/tone/threshold values actually in effect, for provenance."""
+    return {
+        "cue_duration_s": CUE_DURATION_S,
+        "iti_s": [ITI_MIN_S, ITI_MAX_S],
+        "response_window_s": [RESPONSE_MIN_S, RESPONSE_MAX_S],
+        "response_timeout_s": RESPONSE_TIMEOUT_S,
+        "tone": {
+            "low_hz": TONE_FREQ_LOW,
+            "high_hz": TONE_FREQ_HIGH,
+            "duration_s": TONE_DURATION_S,
+            "delay_s": 0.0,
+        },
+        "press_threshold": threshold,
+        "fsr_sample_rate": SAMPLE_RATE,
+    }
+
+
+class ExperimentStore:
+    """Read/modify/atomically-save a participant's exp.json.
+
+    Holds the JSON as a plain dict (mirrors the file exactly) so live appends —
+    e.g. one trial at a time — stay trivial and serialization can't drift.
+    """
+
+    def __init__(self, path: Path, data: dict):
+        self.path = path
+        self.data = data
+        self._next_session = 1 + max((s["id"] for s in data["sessions"]), default=0)
+        self._next_run = 1 + max((r["id"] for r in data["runs"]), default=0)
+
+    # ── create / load ─────────────────────────────────────────────────────────
+
+    @classmethod
+    def open_or_create(
+        cls, participant_id: str, threshold: float, hardware: dict,
+        runs_per_task: int, trials_per_run: int,
+    ) -> "ExperimentStore":
+        path = DATA_ROOT / participant_id / EXP_FILENAME
+        if path.exists():
+            with open(path, encoding="utf-8") as fh:
+                return cls(path, json.load(fh))
+
+        # New participant: randomise the cue map once, now.
+        cue_map = parse_cue_map("random")
+        data = {
+            "schema_version": SCHEMA_VERSION,
+            "participant_id": participant_id,
+            "created_at": _now_iso(),
+            "design": {
+                "task_order": list(TASK_ORDER),
+                "cue_map": cue_map_to_dict(cue_map),
+                "runs_per_task": runs_per_task,
+                "trials_per_run": trials_per_run,
+            },
+            "subject": {"age": None, "sex": None, "dominant_hand": None, "notes": ""},
+            "defaults": config_snapshot(threshold),
+            "hardware": hardware,
+            "calibrations": [],
+            "sessions": [],
+            "runs": [],
+        }
+        store = cls(path, data)
+        store.save()
+        return store
+
+    def save(self) -> None:
+        """Atomic write: tmp file + os.replace (atomic on Windows and POSIX)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+
+    # ── sessions ──────────────────────────────────────────────────────────────
+
+    def recover_crashes(self) -> int:
+        """Mark prior sessions with no end_time as crashed; abort their runs.
+
+        Called before the current session is registered, so every open-ended
+        session found here belongs to a previous process launch.
+        """
+        crashed = {
+            s["id"] for s in self.data["sessions"] if s["end_time"] is None
+        }
+        for s in self.data["sessions"]:
+            if s["id"] in crashed:
+                s["clean_exit"] = False
+        for r in self.data["runs"]:
+            if r["status"] == "in_progress" and r["session_id"] in crashed:
+                r["status"] = "aborted"
+                r["abort_reason"] = "process_exited"
+        return len(crashed)
+
+    def start_session(self, experimenter: str | None) -> int:
+        session_id = self._next_session
+        self._next_session += 1
+        self.data["sessions"].append({
+            "id": session_id,
+            "start_time": _now_iso(),
+            "end_time": None,
+            "clean_exit": False,
+            "experimenter": experimenter or "",
+            "software": {"git_commit": _git_commit(), "version": SOFTWARE_VERSION},
+            "machine": {
+                "hostname": socket.gethostname(),
+                "os": sys.platform,
+                "python": platform.python_version(),
+            },
+            "lsl_source_ids": {"fsr": SOURCE_ID_FSR, "markers": SOURCE_ID_MARKERS},
+        })
+        return session_id
+
+    def end_session(self, session_id: int, clean_exit: bool) -> None:
+        for s in self.data["sessions"]:
+            if s["id"] == session_id:
+                s["end_time"] = _now_iso()
+                s["clean_exit"] = clean_exit
+                return
+
+    # ── runs ──────────────────────────────────────────────────────────────────
+
+    def completed_count(self, task: str) -> int:
+        return sum(
+            1 for r in self.data["runs"]
+            if r["task"] == task and r["status"] == "completed"
+        )
+
+    def next_task(self) -> str | None:
+        """First task in order still short of its run target, else None."""
+        target = self.data["design"]["runs_per_task"]
+        for task in self.data["design"]["task_order"]:
+            if self.completed_count(task) < target:
+                return task
+        return None
+
+    def start_run(
+        self, session_id: int, task: str, cue_map: dict[Condition, Shape],
+        threshold: float, seed: int, recording_file: str,
+    ) -> int:
+        run_id = self._next_run
+        self._next_run += 1
+        self.data["runs"].append({
+            "id": run_id,
+            "session_id": session_id,
+            "task": task,
+            "status": "in_progress",
+            "start_time": _now_iso(),
+            "end_time": None,
+            "cue_map": cue_map_to_dict(cue_map),
+            "config": config_snapshot(threshold),
+            "rng_seed": seed,
+            "recording_file": recording_file,
+            "abort_reason": None,
+            "trials": [],
+        })
+        return run_id
+
+    def _run(self, run_id: int) -> dict:
+        return next(r for r in self.data["runs"] if r["id"] == run_id)
+
+    def append_trial(self, run_id: int, trial: dict) -> None:
+        self._run(run_id)["trials"].append(trial)
+
+    def finish_run(self, run_id: int, status: str, abort_reason: str | None) -> None:
+        run = self._run(run_id)
+        run["status"] = status
+        run["end_time"] = _now_iso()
+        run["abort_reason"] = abort_reason
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -592,6 +1002,321 @@ def cmd_preview_cues(args: argparse.Namespace) -> int:
             if not wait(args.seconds, display):
                 break
     finally:
+        display.close()
+    return 0
+
+
+def suggested_recording_path(participant_id: str, task: str, ordinal: int) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return str(DATA_ROOT / participant_id / f"{task}_run{ordinal}_{stamp}.xdf")
+
+
+def run_one(
+    store: ExperimentStore,
+    session_id: int,
+    task: str,
+    cue_map: dict[Condition, Shape],
+    reader: SerialReader,
+    display: Display,
+    markers: StreamOutlet,
+    threshold: float,
+) -> str:
+    """Run one block, persisting each trial live. Returns the final run status."""
+    design = store.data["design"]
+    trials_per_run = design["trials_per_run"]
+    ordinal = store.completed_count(task) + 1
+
+    seed = random.randrange(2**31)
+    random.seed(seed)  # Make the trial order (and ITIs) reproducible from the seed.
+    trials = build_block(trials_per_run)
+
+    recording_file = suggested_recording_path(store.data["participant_id"], task, ordinal)
+    run_id = store.start_run(session_id, task, cue_map, threshold, seed, recording_file)
+    store.save()
+
+    print(f"\n=== {task} run {ordinal}/{design['runs_per_task']} (run id {run_id}) ===")
+    markers.push_sample([f"run_start id={run_id} task={task} ordinal={ordinal}"], local_clock())
+    markers.push_sample([f"cue_map {format_cue_map(cue_map)}"], local_clock())
+
+    status, reason = "completed", None
+    try:
+        for i, trial in enumerate(trials, start=1):
+            tr = present_trial(i, trial, cue_map[trial.condition], reader, display, markers)
+            if tr is None:  # user quit mid-run
+                status, reason = "aborted", "user_quit"
+                break
+            store.append_trial(run_id, trial_result_to_dict(tr))
+            store.save()
+            print_trial(tr, len(trials))
+    finally:
+        markers.push_sample([f"run_end id={run_id} status={status}"], local_clock())
+        store.finish_run(run_id, status, reason)
+        store.save()
+    return status
+
+
+def run_experiment_loop(
+    store: ExperimentStore,
+    session_id: int,
+    cue_map: dict[Condition, Shape],
+    reader: SerialReader,
+    display: Display,
+    markers: StreamOutlet,
+    threshold: float,
+) -> None:
+    first = True
+    while not display.quit:
+        task = store.next_task()
+        if task is None:
+            display.show_message(["Experiment complete.", "", "Thank you!"])
+            wait(3.0, display)
+            break
+
+        if Modality(task) != Modality.IDENTITY:  # TODO: intensity support
+            print(f"Next task '{task}' is not implemented yet; stopping.")
+            display.show_message([f"The '{task}' task is not ready yet.", "", "Stopping here."])
+            wait(3.0, display)
+            break
+
+        # Go straight into the first run; gate subsequent runs behind a hold.
+        if not first and not wait_for_hold(reader, display, BETWEEN_RUN_LINES):
+            break
+        first = False
+
+        if run_one(store, session_id, task, cue_map, reader, display, markers, threshold) == "aborted":
+            break
+
+        # Brief blank pause after the block before the break / completion screen.
+        display.show_fixation()
+        if not wait(END_OF_RUN_PAUSE_S, display):
+            break
+
+
+def validate_study_params(trials_per_run: int, runs_per_task: int) -> str | None:
+    """Return an error message if the study-size parameters are invalid."""
+    if trials_per_run <= 0 or trials_per_run % 4 != 0:
+        return f"--trials-per-run must be a positive multiple of 4 (got {trials_per_run})"
+    if runs_per_task <= 0:
+        return f"--runs-per-task must be positive (got {runs_per_task})"
+    return None
+
+
+def has_completed_runs(store: ExperimentStore) -> bool:
+    return any(r["status"] == "completed" for r in store.data["runs"])
+
+
+def cmd_experiment(args: argparse.Namespace) -> int:
+    participant_id = f"{args.participant:03d}"
+
+    # Validate the study size BEFORE touching disk, so a bad value can never be
+    # written into (and get stuck in) a participant folder.
+    msg = validate_study_params(args.trials_per_run, args.runs_per_task)
+    if msg:
+        print(msg)
+        return 1
+
+    participant_path = DATA_ROOT / participant_id
+    was_new = not participant_path.exists()
+
+    hardware = {
+        "emg": {"array": None, "placement": None, "sample_rate_hz": None},
+        "audio_device": args.audio_device,
+        "earplugs": "",
+        "serial_port": args.port,
+    }
+
+    store: ExperimentStore | None = None
+    reader: SerialReader | None = None
+    display: Display | None = None
+    session_id: int | None = None
+    ok = False
+    try:
+        store = ExperimentStore.open_or_create(
+            participant_id, args.threshold, hardware,
+            args.runs_per_task, args.trials_per_run,
+        )
+        # Guard against an older/hand-edited folder with an unusable size.
+        stored_trials = store.data["design"]["trials_per_run"]
+        if stored_trials % 4 != 0:
+            print(
+                f"Participant {participant_id} has an invalid stored "
+                f"trials_per_run={stored_trials}; its folder is unusable. "
+                f"Delete {participant_path} to recreate it."
+            )
+            return 1
+
+        if store.recover_crashes():
+            print("Recovered crashed session(s); their open runs marked aborted.")
+        store.save()
+
+        cue_map = cue_map_from_dict(store.data["design"]["cue_map"])
+        target = store.data["design"]["runs_per_task"]
+        print(f"Participant {participant_id} | cue_map={format_cue_map(cue_map)}")
+        for task in store.data["design"]["task_order"]:
+            print(f"  {task}: {store.completed_count(task)}/{target} runs completed")
+
+        # Bring up audio + serial before the fullscreen window, so a failure
+        # never leaves a black screen hanging around.
+        fsr_outlet, marker_outlet = create_outlets()
+        audio = AudioEngine(Modality.IDENTITY, device=args.audio_device)
+        reader = SerialReader(args.port, args.threshold, audio, fsr_outlet, marker_outlet)
+        reader.start()
+        time.sleep(0.5)  # Let the serial port settle.
+        if reader.error is not None:
+            print(f"Serial error: {reader.error}")
+        else:
+            display = Display()
+            session_id = store.start_session(args.experimenter)
+            store.save()
+            run_experiment_loop(
+                store, session_id, cue_map, reader, display, marker_outlet, args.threshold
+            )
+            ok = True
+    except Exception:
+        traceback.print_exc()
+    finally:
+        if reader is not None:
+            reader.stop()
+        if session_id is not None and store is not None:
+            store.end_session(session_id, clean_exit=ok)
+        # On failure, discard a freshly created participant that produced no
+        # completed run, so a bad first attempt leaves nothing to clean up.
+        rolled_back = False
+        if not ok and store is not None and was_new and not has_completed_runs(store):
+            shutil.rmtree(participant_path, ignore_errors=True)
+            rolled_back = True
+            print(f"No runs completed — removed freshly created {participant_path}.")
+        if store is not None and not rolled_back:
+            store.save()
+        if display is not None:
+            display.close()
+    return 0 if ok else 1
+
+
+# ── Training ───────────────────────────────────────────────────────────────
+
+WELCOME_LINES = [
+    "Welcome, and thank you for taking part!",
+    "",
+    "This short training will walk you through the task",
+    "before the real experiment begins.",
+]
+
+DESCRIPTION_LINES = [
+    "On each trial a symbol appears in the centre of the screen.",
+    "Wait about one second after it appears,",
+    "then tap the sensor once with your finger.",
+    "",
+    "Each tap produces a short tone.",
+    "Keep the rest of your hand still and relaxed.",
+]
+
+# Per symbol: the condition, a description of its outcome, and the fixed outcome
+# sequence to practise. PH/PL have one outcome; MIX demonstrates both.
+TRAINING_SYMBOLS = [
+    (Condition.PH, "a HIGH tone", [Tone.HIGH, Tone.HIGH, Tone.HIGH]),
+    (Condition.PL, "a LOW tone", [Tone.LOW, Tone.LOW, Tone.LOW]),
+    (Condition.MIX, "either a HIGH or a LOW tone", [Tone.HIGH, Tone.LOW, Tone.LOW]),
+]
+
+TRAINING_SUCCESS = ("valid", "late")  # Misses to retry: "early" and "timeout".
+
+
+def practice_symbol(
+    condition: Condition,
+    outcomes: list[Tone],
+    cue_map: dict[Condition, Shape],
+    reader: SerialReader,
+    display: Display,
+    markers: StreamOutlet,
+) -> bool:
+    """Practise one symbol: repeat each outcome until a good tap. False if quit."""
+    shape = cue_map[condition]
+    markers.push_sample([f"training_practice {condition.value}"], local_clock())
+    attempt = 0
+    for target in outcomes:
+        while True:
+            attempt += 1
+            tr = present_trial(attempt, Trial(condition, target), shape, reader, display, markers)
+            if tr is None:
+                return False
+            if tr.result in TRAINING_SUCCESS:
+                print(f"  practice {condition.value}/{target.value}: {tr.result} OK")
+                break
+            print(f"  practice {condition.value}/{target.value}: {tr.result} — retry")
+            if tr.result == "early":
+                feedback = ["Too early!", "Wait about a second after the",
+                            "symbol appears, then tap once."]
+            else:  # timeout
+                feedback = ["No tap detected.", "Tap the sensor once when",
+                            "you see the symbol."]
+            display.show_message(feedback)
+            if not wait(2.0, display):
+                return False
+    return True
+
+
+def run_training(
+    cue_map: dict[Condition, Shape],
+    reader: SerialReader,
+    display: Display,
+    markers: StreamOutlet,
+) -> None:
+    markers.push_sample(["training_start"], local_clock())
+
+    if not wait_for_hold(reader, display, WELCOME_LINES):
+        return
+    if not wait_for_hold(reader, display, DESCRIPTION_LINES):
+        return
+
+    for condition, outcome_desc, outcomes in TRAINING_SYMBOLS:
+        intro = [
+            "When you see this symbol,",
+            f"your tap will produce {outcome_desc}.",
+            "",
+            "We will now practise this symbol.",
+        ]
+        if not wait_for_hold(reader, display, intro, shape=cue_map[condition]):
+            return
+        if not practice_symbol(condition, outcomes, cue_map, reader, display, markers):
+            return
+
+    markers.push_sample(["training_end"], local_clock())
+    display.show_message(["Training complete.", "", "Well done!"])
+    wait(3.0, display)
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    participant_id = f"{args.participant:03d}"
+    hardware = {
+        "emg": {"array": None, "placement": None, "sample_rate_hz": None},
+        "audio_device": args.audio_device,
+        "earplugs": "",
+        "serial_port": args.port,
+    }
+    # Use the participant's stored cue map (creating them — and fixing the map —
+    # on first contact) so training matches the real experiment exactly.
+    store = ExperimentStore.open_or_create(
+        participant_id, args.threshold, hardware,
+        DEFAULT_RUNS_PER_TASK, DEFAULT_TRIALS_PER_RUN,
+    )
+    cue_map = cue_map_from_dict(store.data["design"]["cue_map"])
+    print(f"Training participant {participant_id} | cue_map={format_cue_map(cue_map)}")
+
+    fsr_outlet, marker_outlet = create_outlets()
+    audio = AudioEngine(Modality.IDENTITY, device=args.audio_device)
+    reader = SerialReader(args.port, args.threshold, audio, fsr_outlet, marker_outlet)
+    reader.start()
+    time.sleep(0.5)  # Let the serial port settle.
+    if reader.error is not None:
+        print(f"Serial error: {reader.error}")
+        return 1
+
+    display = Display()
+    try:
+        run_training(cue_map, reader, display, marker_outlet)
+    finally:
+        reader.stop()
         display.close()
     return 0
 
@@ -659,6 +1384,53 @@ def main() -> int:
         "--seconds", type=float, default=1.5, help="Seconds per shape (default 1.5)"
     )
     preview.set_defaults(func=cmd_preview_cues)
+
+    exp = sub.add_parser("experiment", help="Run the experiment for a participant")
+    exp.add_argument("participant", type=int, help="Participant number (-> data/NNN)")
+    exp.add_argument(
+        "--port", default=DEFAULT_PORT, help=f"Serial port (default {DEFAULT_PORT})"
+    )
+    exp.add_argument(
+        "--audio-device",
+        default=None,
+        help="Exact output device name for the tones; see 'audio-devices'.",
+    )
+    exp.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=f"FSR press-detection threshold (default {DEFAULT_THRESHOLD})",
+    )
+    exp.add_argument("--experimenter", default=None, help="Experimenter name (logged)")
+    # Study structure — hard-coded defaults, overridable but rarely needed. Only
+    # used when a participant is first created; afterwards the stored design wins.
+    exp.add_argument(
+        "--runs-per-task", type=int, default=DEFAULT_RUNS_PER_TASK,
+        help=f"Runs per task for a NEW participant (default {DEFAULT_RUNS_PER_TASK})",
+    )
+    exp.add_argument(
+        "--trials-per-run", type=int, default=DEFAULT_TRIALS_PER_RUN,
+        help=f"Trials per run for a NEW participant (default {DEFAULT_TRIALS_PER_RUN})",
+    )
+    exp.set_defaults(func=cmd_experiment)
+
+    train = sub.add_parser("train", help="Run the training sequence for a participant")
+    train.add_argument("participant", type=int, help="Participant number (-> data/NNN)")
+    train.add_argument(
+        "--port", default=DEFAULT_PORT, help=f"Serial port (default {DEFAULT_PORT})"
+    )
+    train.add_argument(
+        "--audio-device",
+        default=None,
+        help="Exact output device name for the tones; see 'audio-devices'.",
+    )
+    train.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=f"FSR press-detection threshold (default {DEFAULT_THRESHOLD})",
+    )
+    train.set_defaults(func=cmd_train)
 
     args = parser.parse_args()
     if args.command == "audio-devices":
