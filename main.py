@@ -17,13 +17,34 @@ Within a single block of N trials the conditions are intermixed:
     N/4 PL, N/4 PH, and N/2 MIX (split N/4 MIX->low, N/4 MIX->high).
 N must therefore be divisible by 4.
 
-Each block modulates a single stimulus dimension (--modality):
-    identity  -> low/high differ in frequency   (220 Hz vs 988 Hz)   [supported]
-    intensity -> low/high differ in volume                           [not yet]
+Each block modulates a single stimulus dimension:
+    identity  -> low/high differ in frequency (220 Hz vs 988 Hz)
+    intensity -> soft/loud differ in volume at one frequency (440 Hz)
+
+The experiment runs both tasks (one fully, then the other); task order is
+counterbalanced per participant and training uses the first task's modality.
 
 LSL streams (same schema as duino_bridge_minimal.py):
     FSR_force  float32  ~830 Hz continuous force
     Markers    string   irregular-rate event markers
+
+Marker vocabulary (space-separated "event key=value ..."; every trial-level
+event carries run= and trial= so a recording can be segmented and matched to
+data/NNN/exp.json by run id without the console log):
+    run_start  participant=001 run=3 task=identity ordinal=1
+    cue_map    run=3 PL=diamond,PH=star,MIX=hexagon
+    trial_start   run=3 trial=5
+    cue           run=3 trial=5 condition=MIX
+    outcome       run=3 trial=5 tone=high      (planned outcome, at cue onset)
+    cue_offset    run=3 trial=5
+    press         run=3 trial=5 force=72.3     (FSR threshold crossed; precise t)
+    audio         run=3 trial=5 tone=high      (tone triggered; same t as press)
+    release       run=3 trial=5 force=12.0     (force returned to rest)
+    trial_timeout run=3 trial=5                (no press within the window)
+    run_end    run=3 status=completed
+    task_transition task=intensity
+    training_start modality=identity / training_practice condition=PH /
+    training_end       (training trials use run=train-PH/PL/MIX)
 
 Audio uses the PsychoPy PTB backend, matching duino_bridge_minimal.py, and is
 played directly from the serial-reader thread the instant the press threshold is
@@ -33,8 +54,16 @@ Usage:
     python main.py experiment 3 [--port COM3] [--audio-device NAME]
         Run the full experiment for participant 3 (data/003/exp.json). Creates
         the participant (randomising the cue map) on first launch, resumes from
-        where it left off otherwise, and gates between runs behind a 3 s FSR
+        where it left off otherwise, and gates between runs behind a 1.5 s FSR
         hold. trials-per-run and runs-per-task default to 60 and 5.
+
+    python main.py train 3 [--port COM3] [--audio-device NAME]
+        Run the training sequence for participant 3 (first task's modality).
+
+    python main.py calibrate 3 [--port COM3]
+        Record known-weight -> raw FSR points; appended to exp.json with a
+        timestamp (several calibrations accumulate; pick the closest in
+        processing to convert force to Newtons).
 
     python main.py block [--port COM3] [--trials 60] [--modality identity]
         Run a single standalone block (no data files).
@@ -53,6 +82,7 @@ import platform
 import random
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import traceback
@@ -78,6 +108,8 @@ BAUD_RATE = 115200
 DEFAULT_PORT = "COM3"
 DEFAULT_TRIALS = 60
 DEFAULT_THRESHOLD = 40.0
+RELEASE_RATIO = 0.5  # Release detected below RELEASE_RATIO*threshold (hysteresis)
+GRAVITY = 9.80665  # m/s^2, for grams -> Newtons in force calibration
 
 CUE_DURATION_S = 0.300  # Cue symbol display time
 ITI_MIN_S = 2.5  # Inter-trial interval (fixation) bounds
@@ -89,10 +121,16 @@ RESPONSE_TIMEOUT_S = 4.0  # Max wait for a press after cue onset
 RESPONSE_MIN_S = 1.0
 RESPONSE_MAX_S = 2.0
 
-# Identity-modality tones.
+# Identity-modality tones: differ in frequency, equal volume.
 TONE_FREQ_LOW = 220
 TONE_FREQ_HIGH = 988
 TONE_DURATION_S = 0.050
+
+# Intensity-modality tones: one frequency, differing volume (soft vs loud).
+# Volumes are placeholders to be calibrated against the earplugs in use.
+INTENSITY_FREQ = 440
+INTENSITY_VOL_LOW = 0.25  # soft
+INTENSITY_VOL_HIGH = 1.0  # loud
 
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
@@ -111,7 +149,7 @@ EXP_FILENAME = "exp.json"
 
 DEFAULT_RUNS_PER_TASK = 5
 DEFAULT_TRIALS_PER_RUN = 60
-TASK_ORDER = ["identity", "intensity"]  # TODO: counterbalance once intensity lands
+TASKS = ("identity", "intensity")  # Task order is counterbalanced per participant.
 
 HOLD_SECONDS = 1.5  # Continuous FSR press needed to advance (hold-to-continue)
 HOLD_PROMPT = "Press and hold the surface to continue."
@@ -137,6 +175,14 @@ class Tone(Enum):
 class Modality(Enum):
     IDENTITY = "identity"
     INTENSITY = "intensity"
+
+
+# Words used for the two outcomes in each modality, for participant-facing text.
+# LOW/HIGH are the internal outcome labels; these are what the participant reads.
+MODALITY_WORDS: dict[Modality, dict[Tone, str]] = {
+    Modality.IDENTITY: {Tone.LOW: "low", Tone.HIGH: "high"},
+    Modality.INTENSITY: {Tone.LOW: "soft", Tone.HIGH: "loud"},
+}
 
 
 class Shape(Enum):
@@ -266,45 +312,60 @@ def list_audio_devices() -> int:
     return 0
 
 
-class AudioEngine:
-    """Pre-loads the low/high tones for a modality and plays them immediately."""
+def select_audio_device(device: str | None) -> None:
+    """Point PsychoPy at ``device`` before any Sound opens the PTB stream.
 
-    def __init__(self, modality: Modality, device: str | None = None):
-        if modality != Modality.IDENTITY:
-            raise NotImplementedError(
-                f"modality {modality.value!r} not supported yet (only 'identity')"
+    Call once, before building AudioEngines. PsychoPy matches the name exactly;
+    an unmatched name yields silence, so if it isn't in the enumeration we warn
+    and leave the system default in place rather than set a dud.
+    """
+    if device:
+        names = [d["DeviceName"] for d in _output_devices()]
+        if names and device not in names:
+            print(
+                f"[audio] WARNING: device {device!r} not found; using system "
+                f"default. Run 'audio-devices' for the exact names."
             )
-        # Select the output device before the first Sound opens the PTB stream.
-        # PsychoPy matches the device name exactly. If the requested name isn't
-        # in the enumeration, don't set it (an unmatched name yields silence) —
-        # warn and fall back to the system default instead.
-        if device:
-            names = [d["DeviceName"] for d in _output_devices()]
-            if names and device not in names:
-                print(
-                    f"[audio] WARNING: device {device!r} not found; using system "
-                    f"default. Run 'audio-devices' for the exact names."
-                )
-            else:
-                prefs.hardware["audioDevice"] = device
-        selected = prefs.hardware.get("audioDevice") or "(system default)"
-        print(f"[audio] output device: {selected}")
-        self._tones = {
-            Tone.LOW: sound.Sound(
-                value=TONE_FREQ_LOW,
-                secs=TONE_DURATION_S,
-                stereo=True,
-                hamming=True,
-                name="low",
-            ),
-            Tone.HIGH: sound.Sound(
-                value=TONE_FREQ_HIGH,
-                secs=TONE_DURATION_S,
-                stereo=True,
-                hamming=True,
-                name="high",
-            ),
-        }
+        else:
+            prefs.hardware["audioDevice"] = device
+    selected = prefs.hardware.get("audioDevice") or "(system default)"
+    print(f"[audio] output device: {selected}")
+
+
+class AudioEngine:
+    """Pre-loads the two outcome tones for a modality and plays them instantly.
+
+    Identity: LOW/HIGH differ in frequency at equal volume.
+    Intensity: LOW/HIGH are soft/loud at one frequency.
+
+    Call select_audio_device() once before constructing any AudioEngine.
+    """
+
+    def __init__(self, modality: Modality):
+        if modality == Modality.IDENTITY:
+            self._tones = {
+                Tone.LOW: sound.Sound(
+                    value=TONE_FREQ_LOW, secs=TONE_DURATION_S, stereo=True,
+                    hamming=True, name="low",
+                ),
+                Tone.HIGH: sound.Sound(
+                    value=TONE_FREQ_HIGH, secs=TONE_DURATION_S, stereo=True,
+                    hamming=True, name="high",
+                ),
+            }
+        elif modality == Modality.INTENSITY:
+            self._tones = {
+                Tone.LOW: sound.Sound(
+                    value=INTENSITY_FREQ, secs=TONE_DURATION_S, stereo=True,
+                    hamming=True, volume=INTENSITY_VOL_LOW, name="soft",
+                ),
+                Tone.HIGH: sound.Sound(
+                    value=INTENSITY_FREQ, secs=TONE_DURATION_S, stereo=True,
+                    hamming=True, volume=INTENSITY_VOL_HIGH, name="loud",
+                ),
+            }
+        else:
+            raise NotImplementedError(f"modality {modality.value!r} not supported")
 
     def play(self, tone: Tone) -> None:
         """Play a tone. Called from the serial thread; must not block."""
@@ -317,23 +378,31 @@ class AudioEngine:
 class SerialReader(threading.Thread):
     """Streams FSR samples to LSL and triggers the armed tone on a press.
 
-    The main loop arms the reader with the current trial's tone; the next rising
-    edge across ``threshold`` plays that tone, records the press and fires
-    ``press_event``. Playing the sound here (rather than from the main loop)
-    keeps the press->sound path as short as possible.
+    The main loop arms the reader with the current trial's tone and a context
+    string (``run=.. trial=..``); the next rising edge across ``threshold``
+    plays that tone, records the press and fires ``press_event``. Playing the
+    sound here (rather than from the main loop) keeps the press->sound path as
+    short as possible. A matching ``release`` marker is emitted when the force
+    later falls below RELEASE_RATIO*threshold (hysteresis avoids chatter).
+
+    Markers emitted here, all timestamped at the triggering FSR sample:
+        press  <ctx> force=<f>     (threshold crossed upward during a trial)
+        audio  <ctx> tone=<t>      (tone triggered; ctx = run/trial context)
+        release <ctx> force=<f>    (force fell back to rest)
     """
 
     def __init__(
         self,
         port: str,
         threshold: float,
-        audio: AudioEngine,
+        audio: AudioEngine | None,
         fsr_outlet: StreamOutlet,
         marker_outlet: StreamOutlet,
     ):
         super().__init__(daemon=True)
         self.port = port
         self.threshold = threshold
+        self.release_threshold = threshold * RELEASE_RATIO
         self.audio = audio
         self.fsr_outlet = fsr_outlet
         self.marker_outlet = marker_outlet
@@ -346,12 +415,15 @@ class SerialReader(threading.Thread):
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._armed_tone: Tone | None = None
-        self._below = True  # Whether the last sample was below threshold.
+        self._context = ""  # "run=.. trial=.." to tag this trial's markers.
+        self._pressing = False  # Whether force is currently above threshold.
+        self._active_ctx: str | None = None  # Context of an ongoing armed press.
 
-    def arm(self, tone: Tone) -> None:
+    def arm(self, tone: Tone, context: str) -> None:
         """Begin accepting a press for the current trial."""
         with self._lock:
             self._armed_tone = tone
+            self._context = context
         self.press_info = None
         self.press_event.clear()
 
@@ -390,16 +462,26 @@ class SerialReader(threading.Thread):
 
     def _detect_press(self, value: float, t: float) -> None:
         with self._lock:
-            armed = self._armed_tone
-            rising_edge = self._below and value >= self.threshold
-            if armed is not None and rising_edge:
-                self.audio.play(armed)  # Fire sound first — latency critical.
-                self.marker_outlet.push_sample([f"press_start {value:.1f}"], t)
-                self.marker_outlet.push_sample([f"audio {armed.value}"], t)
-                self.press_info = PressInfo(t=t, force=value)
-                self._armed_tone = None
-                self.press_event.set()
-            self._below = value < self.threshold
+            if not self._pressing and value >= self.threshold:
+                self._pressing = True
+                if self._armed_tone is not None:  # a real trial press
+                    self.audio.play(self._armed_tone)  # fire sound first — latency
+                    ctx = self._context
+                    self.marker_outlet.push_sample([f"press {ctx} force={value:.1f}"], t)
+                    self.marker_outlet.push_sample(
+                        [f"audio {ctx} tone={self._armed_tone.value}"], t
+                    )
+                    self.press_info = PressInfo(t=t, force=value)
+                    self._active_ctx = ctx
+                    self._armed_tone = None
+                    self.press_event.set()
+            elif self._pressing and value < self.release_threshold:
+                self._pressing = False
+                if self._active_ctx is not None:
+                    self.marker_outlet.push_sample(
+                        [f"release {self._active_ctx} force={value:.1f}"], t
+                    )
+                    self._active_ctx = None
 
 
 # ── Display ──────────────────────────────────────────────────────────────────
@@ -670,27 +752,34 @@ def present_trial(
     reader: SerialReader,
     display: Display,
     markers: StreamOutlet,
+    run_tag: str = "block",
 ) -> TrialResult | None:
-    """Run one trial (ITI -> cue -> wait for press). None if the user quit."""
+    """Run one trial (ITI -> cue -> wait for press). None if the user quit.
+
+    ``run_tag`` tags every marker with ``run=<tag> trial=<index>`` so the LSL
+    recording can be segmented and cross-referenced without the console log.
+    """
+    ctx = f"run={run_tag} trial={index}"
+
     # ── Inter-trial interval (fixation) ───────────────────────────────────────
     display.show_fixation()
-    markers.push_sample([f"trial_start {index}"], local_clock())
+    markers.push_sample([f"trial_start {ctx}"], local_clock())
     if not wait(random.uniform(ITI_MIN_S, ITI_MAX_S), display):
         return None
 
     # ── Cue (300 ms) ──────────────────────────────────────────────────────────
     display.show_cue(shape)
     cue_t = local_clock()
-    markers.push_sample([f"cue {trial.condition.value}"], cue_t)
+    markers.push_sample([f"cue {ctx} condition={trial.condition.value}"], cue_t)
     # Record the planned outcome so MIX trials are decodable downstream.
-    markers.push_sample([f"outcome {trial.tone.value}"], cue_t)
+    markers.push_sample([f"outcome {ctx} tone={trial.tone.value}"], cue_t)
     if not wait(CUE_DURATION_S, display):
         return None
 
     # ── Fixation + wait for press ─────────────────────────────────────────────
     display.show_fixation()
-    markers.push_sample(["cue_offset"], local_clock())
-    reader.arm(trial.tone)
+    markers.push_sample([f"cue_offset {ctx}"], local_clock())
+    reader.arm(trial.tone, ctx)
     press = wait_for_press(reader, RESPONSE_TIMEOUT_S, display)
     reader.disarm()
 
@@ -698,7 +787,7 @@ def present_trial(
         return None
 
     if press is None:
-        markers.push_sample([f"trial_timeout {index}"], local_clock())
+        markers.push_sample([f"trial_timeout {ctx}"], local_clock())
         return TrialResult(
             index, trial.condition, trial.tone, shape, cue_t, None, None, None, "timeout"
         )
@@ -816,14 +905,18 @@ class ExperimentStore:
             with open(path, encoding="utf-8") as fh:
                 return cls(path, json.load(fh))
 
-        # New participant: randomise the cue map once, now.
+        # New participant: randomise the cue map, and counterbalance task order
+        # by participant-number parity (odd -> identity first, even -> intensity
+        # first) so the two orders stay balanced across participants.
         cue_map = parse_cue_map("random")
+        identity_first = int(participant_id) % 2 == 1
+        task_order = list(TASKS) if identity_first else list(reversed(TASKS))
         data = {
             "schema_version": SCHEMA_VERSION,
             "participant_id": participant_id,
             "created_at": _now_iso(),
             "design": {
-                "task_order": list(TASK_ORDER),
+                "task_order": task_order,
                 "cue_map": cue_map_to_dict(cue_map),
                 "runs_per_task": runs_per_task,
                 "trials_per_run": trials_per_run,
@@ -831,6 +924,7 @@ class ExperimentStore:
             "subject": {"age": None, "sex": None, "dominant_hand": None, "notes": ""},
             "defaults": config_snapshot(threshold),
             "hardware": hardware,
+            "training_completed_at": None,  # ISO time once training is finished
             "calibrations": [],
             "sessions": [],
             "runs": [],
@@ -961,7 +1055,8 @@ def cmd_block(args: argparse.Namespace) -> int:
     )
 
     fsr_outlet, marker_outlet = create_outlets()
-    audio = AudioEngine(modality, device=args.audio_device)
+    select_audio_device(args.audio_device)
+    audio = AudioEngine(modality)
     display = Display()
     reader = SerialReader(args.port, args.threshold, audio, fsr_outlet, marker_outlet)
     reader.start()
@@ -983,11 +1078,13 @@ def cmd_block(args: argparse.Namespace) -> int:
 
 
 def cmd_test_audio(args: argparse.Namespace) -> int:
-    """Play the low then high tone so the chosen output device can be verified."""
-    audio = AudioEngine(Modality(args.modality), device=args.audio_device)
-    print(f"Playing on {args.audio_device or '(system default)'}")
+    """Play the two tones so the chosen output device can be verified."""
+    select_audio_device(args.audio_device)
+    modality = Modality(args.modality)
+    audio = AudioEngine(modality)
+    words = MODALITY_WORDS[modality]
     for tone in (Tone.LOW, Tone.HIGH):
-        print(f"  {tone.value}")
+        print(f"  {words[tone]}")
         audio.play(tone)
         time.sleep(0.8)
     return 0
@@ -1034,14 +1131,21 @@ def run_one(
     run_id = store.start_run(session_id, task, cue_map, threshold, seed, recording_file)
     store.save()
 
+    participant = store.data["participant_id"]
     print(f"\n=== {task} run {ordinal}/{design['runs_per_task']} (run id {run_id}) ===")
-    markers.push_sample([f"run_start id={run_id} task={task} ordinal={ordinal}"], local_clock())
-    markers.push_sample([f"cue_map {format_cue_map(cue_map)}"], local_clock())
+    markers.push_sample(
+        [f"run_start participant={participant} run={run_id} task={task} ordinal={ordinal}"],
+        local_clock(),
+    )
+    markers.push_sample([f"cue_map run={run_id} {format_cue_map(cue_map)}"], local_clock())
 
     status, reason = "completed", None
     try:
         for i, trial in enumerate(trials, start=1):
-            tr = present_trial(i, trial, cue_map[trial.condition], reader, display, markers)
+            tr = present_trial(
+                i, trial, cue_map[trial.condition], reader, display, markers,
+                run_tag=str(run_id),
+            )
             if tr is None:  # user quit mid-run
                 status, reason = "aborted", "user_quit"
                 break
@@ -1049,10 +1153,20 @@ def run_one(
             store.save()
             print_trial(tr, len(trials))
     finally:
-        markers.push_sample([f"run_end id={run_id} status={status}"], local_clock())
+        markers.push_sample([f"run_end run={run_id} status={status}"], local_clock())
         store.finish_run(run_id, status, reason)
         store.save()
     return status
+
+
+def task_transition_lines(modality: Modality) -> list[str]:
+    words = MODALITY_WORDS[modality]
+    return [
+        "You have finished the first part.",
+        "",
+        "In the next part, each tap will produce",
+        f"a {words[Tone.HIGH].upper()} or a {words[Tone.LOW].upper()} tone.",
+    ]
 
 
 def run_experiment_loop(
@@ -1063,28 +1177,32 @@ def run_experiment_loop(
     display: Display,
     markers: StreamOutlet,
     threshold: float,
+    audio_by_modality: dict[Modality, AudioEngine],
 ) -> None:
-    first = True
+    prev_task: str | None = None
     while not display.quit:
         task = store.next_task()
         if task is None:
             display.show_message(["Experiment complete.", "", "Thank you!"])
             wait(3.0, display)
             break
+        modality = Modality(task)
 
-        if Modality(task) != Modality.IDENTITY:  # TODO: intensity support
-            print(f"Next task '{task}' is not implemented yet; stopping.")
-            display.show_message([f"The '{task}' task is not ready yet.", "", "Stopping here."])
-            wait(3.0, display)
-            break
+        # Gate before the run (not the very first run of the session). A change
+        # of task shows a transition screen; otherwise a short break.
+        if prev_task is not None:
+            if task != prev_task:
+                markers.push_sample([f"task_transition task={task}"], local_clock())
+                if not wait_for_hold(reader, display, task_transition_lines(modality)):
+                    break
+            elif not wait_for_hold(reader, display, BETWEEN_RUN_LINES):
+                break
 
-        # Go straight into the first run; gate subsequent runs behind a hold.
-        if not first and not wait_for_hold(reader, display, BETWEEN_RUN_LINES):
-            break
-        first = False
+        reader.audio = audio_by_modality[modality]  # Play this task's tones.
 
         if run_one(store, session_id, task, cue_map, reader, display, markers, threshold) == "aborted":
             break
+        prev_task = task
 
         # Brief blank pause after the block before the break / completion screen.
         display.show_fixation()
@@ -1150,16 +1268,24 @@ def cmd_experiment(args: argparse.Namespace) -> int:
         store.save()
 
         cue_map = cue_map_from_dict(store.data["design"]["cue_map"])
+        task_order = store.data["design"]["task_order"]
         target = store.data["design"]["runs_per_task"]
-        print(f"Participant {participant_id} | cue_map={format_cue_map(cue_map)}")
-        for task in store.data["design"]["task_order"]:
+        print(f"Participant {participant_id} | order={'/'.join(task_order)} | "
+              f"cue_map={format_cue_map(cue_map)}")
+        for task in task_order:
             print(f"  {task}: {store.completed_count(task)}/{target} runs completed")
+        first_modality = Modality(task_order[0])
 
         # Bring up audio + serial before the fullscreen window, so a failure
-        # never leaves a black screen hanging around.
+        # never leaves a black screen hanging around. Both modalities' tones are
+        # pre-loaded; the reader's engine is swapped per task.
         fsr_outlet, marker_outlet = create_outlets()
-        audio = AudioEngine(Modality.IDENTITY, device=args.audio_device)
-        reader = SerialReader(args.port, args.threshold, audio, fsr_outlet, marker_outlet)
+        select_audio_device(args.audio_device)
+        audio_by_modality = {m: AudioEngine(m) for m in Modality}
+        reader = SerialReader(
+            args.port, args.threshold, audio_by_modality[first_modality],
+            fsr_outlet, marker_outlet,
+        )
         reader.start()
         time.sleep(0.5)  # Let the serial port settle.
         if reader.error is not None:
@@ -1168,9 +1294,24 @@ def cmd_experiment(args: argparse.Namespace) -> int:
             display = Display()
             session_id = store.start_session(args.experimenter)
             store.save()
-            run_experiment_loop(
-                store, session_id, cue_map, reader, display, marker_outlet, args.threshold
-            )
+
+            # Training runs once per participant, before the first run, unless
+            # already done or opted out, and uses the FIRST task's modality. A
+            # quit during training stops here and leaves it unmarked, so it
+            # resumes next time.
+            proceed = True
+            if not args.no_train and not store.data.get("training_completed_at"):
+                if run_training(first_modality, cue_map, reader, display, marker_outlet):
+                    store.data["training_completed_at"] = _now_iso()
+                    store.save()
+                else:
+                    proceed = False  # user quit during training
+
+            if proceed and not display.quit:
+                run_experiment_loop(
+                    store, session_id, cue_map, reader, display, marker_outlet,
+                    args.threshold, audio_by_modality,
+                )
             ok = True
     except Exception:
         traceback.print_exc()
@@ -1211,15 +1352,26 @@ DESCRIPTION_LINES = [
     "Keep the rest of your hand still and relaxed.",
 ]
 
-# Per symbol: the condition, a description of its outcome, and the fixed outcome
-# sequence to practise. PH/PL have one outcome; MIX demonstrates both.
+# Per symbol: the condition and the fixed outcome sequence to practise. PH/PL
+# have one outcome; MIX demonstrates both. The outcome wording is filled in per
+# modality at runtime (high/low vs loud/soft).
 TRAINING_SYMBOLS = [
-    (Condition.PH, "a HIGH tone", [Tone.HIGH, Tone.HIGH, Tone.HIGH]),
-    (Condition.PL, "a LOW tone", [Tone.LOW, Tone.LOW, Tone.LOW]),
-    (Condition.MIX, "either a HIGH or a LOW tone", [Tone.HIGH, Tone.LOW, Tone.LOW]),
+    (Condition.PH, [Tone.HIGH, Tone.HIGH, Tone.HIGH]),
+    (Condition.PL, [Tone.LOW, Tone.LOW, Tone.LOW]),
+    (Condition.MIX, [Tone.HIGH, Tone.LOW, Tone.LOW]),
 ]
 
 TRAINING_SUCCESS = ("valid", "late")  # Misses to retry: "early" and "timeout".
+
+
+def symbol_outcome_phrase(condition: Condition, modality: Modality) -> str:
+    """e.g. 'a HIGH tone' / 'a SOFT tone' / 'either a LOUD or a SOFT tone'."""
+    words = MODALITY_WORDS[modality]
+    if condition == Condition.PH:
+        return f"a {words[Tone.HIGH].upper()} tone"
+    if condition == Condition.PL:
+        return f"a {words[Tone.LOW].upper()} tone"
+    return f"either a {words[Tone.HIGH].upper()} or a {words[Tone.LOW].upper()} tone"
 
 
 def practice_symbol(
@@ -1232,12 +1384,15 @@ def practice_symbol(
 ) -> bool:
     """Practise one symbol: repeat each outcome until a good tap. False if quit."""
     shape = cue_map[condition]
-    markers.push_sample([f"training_practice {condition.value}"], local_clock())
+    markers.push_sample([f"training_practice condition={condition.value}"], local_clock())
     attempt = 0
     for target in outcomes:
         while True:
             attempt += 1
-            tr = present_trial(attempt, Trial(condition, target), shape, reader, display, markers)
+            tr = present_trial(
+                attempt, Trial(condition, target), shape, reader, display, markers,
+                run_tag=f"train-{condition.value}",
+            )
             if tr is None:
                 return False
             if tr.result in TRAINING_SUCCESS:
@@ -1257,33 +1412,36 @@ def practice_symbol(
 
 
 def run_training(
+    modality: Modality,
     cue_map: dict[Condition, Shape],
     reader: SerialReader,
     display: Display,
     markers: StreamOutlet,
-) -> None:
-    markers.push_sample(["training_start"], local_clock())
+) -> bool:
+    """Run the full training sequence for ``modality``. True if completed."""
+    markers.push_sample([f"training_start {modality.value}"], local_clock())
 
     if not wait_for_hold(reader, display, WELCOME_LINES):
-        return
+        return False
     if not wait_for_hold(reader, display, DESCRIPTION_LINES):
-        return
+        return False
 
-    for condition, outcome_desc, outcomes in TRAINING_SYMBOLS:
+    for condition, outcomes in TRAINING_SYMBOLS:
         intro = [
             "When you see this symbol,",
-            f"your tap will produce {outcome_desc}.",
+            f"your tap will produce {symbol_outcome_phrase(condition, modality)}.",
             "",
             "We will now practise this symbol.",
         ]
         if not wait_for_hold(reader, display, intro, shape=cue_map[condition]):
-            return
+            return False
         if not practice_symbol(condition, outcomes, cue_map, reader, display, markers):
-            return
+            return False
 
     markers.push_sample(["training_end"], local_clock())
     display.show_message(["Training complete.", "", "Well done!"])
     wait(3.0, display)
+    return True
 
 
 def cmd_train(args: argparse.Namespace) -> int:
@@ -1301,10 +1459,13 @@ def cmd_train(args: argparse.Namespace) -> int:
         DEFAULT_RUNS_PER_TASK, DEFAULT_TRIALS_PER_RUN,
     )
     cue_map = cue_map_from_dict(store.data["design"]["cue_map"])
-    print(f"Training participant {participant_id} | cue_map={format_cue_map(cue_map)}")
+    modality = Modality(store.data["design"]["task_order"][0])  # first half
+    print(f"Training participant {participant_id} | modality={modality.value} | "
+          f"cue_map={format_cue_map(cue_map)}")
 
     fsr_outlet, marker_outlet = create_outlets()
-    audio = AudioEngine(Modality.IDENTITY, device=args.audio_device)
+    select_audio_device(args.audio_device)
+    audio = AudioEngine(modality)
     reader = SerialReader(args.port, args.threshold, audio, fsr_outlet, marker_outlet)
     reader.start()
     time.sleep(0.5)  # Let the serial port settle.
@@ -1314,10 +1475,106 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     display = Display()
     try:
-        run_training(cue_map, reader, display, marker_outlet)
+        if run_training(modality, cue_map, reader, display, marker_outlet):
+            store.data["training_completed_at"] = _now_iso()
+            store.save()
+            print("Training complete — recorded in exp.json.")
     finally:
         reader.stop()
         display.close()
+    return 0
+
+
+# ── Force calibration ──────────────────────────────────────────────────────
+
+def _sample_force(reader: SerialReader, seconds: float) -> list[float]:
+    """Poll the latest FSR value over a window; averaged for a static weight."""
+    samples = []
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        samples.append(reader.current_force)
+        time.sleep(0.005)
+    return samples
+
+
+def calibration_point(grams: float, samples: list[float]) -> dict:
+    """Summarise a steady reading at a known weight into a calibration point."""
+    mean = statistics.fmean(samples) if samples else 0.0
+    std = statistics.pstdev(samples) if len(samples) > 1 else 0.0
+    return {
+        "time": _now_iso(),
+        "grams": grams,
+        "newtons": round(grams / 1000.0 * GRAVITY, 4),
+        "raw_mean": round(mean, 2),
+        "raw_std": round(std, 2),
+        "n": len(samples),
+    }
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """Record (known weight -> raw FSR) points into the participant's exp.json.
+
+    Each invocation appends one timestamped calibration (with its points), so a
+    processing script can pick the calibration closest in time to each run and
+    convert raw force to Newtons.
+    """
+    participant_id = f"{args.participant:03d}"
+    hardware = {
+        "emg": {"array": None, "placement": None, "sample_rate_hz": None},
+        "audio_device": args.audio_device,
+        "earplugs": "",
+        "serial_port": args.port,
+    }
+    store = ExperimentStore.open_or_create(
+        participant_id, args.threshold, hardware,
+        DEFAULT_RUNS_PER_TASK, DEFAULT_TRIALS_PER_RUN,
+    )
+    print(f"Calibrating participant {participant_id}")
+
+    fsr_outlet, marker_outlet = create_outlets()
+    reader = SerialReader(args.port, args.threshold, None, fsr_outlet, marker_outlet)
+    reader.start()
+    time.sleep(0.5)  # Let the serial port settle.
+    if reader.error is not None:
+        print(f"Serial error: {reader.error}")
+        return 1
+
+    print(
+        "For each known weight: enter its mass in grams, rest it on the sensor, "
+        "then press Enter to measure.\nInclude a 0 g reading for the baseline. "
+        "Leave the weight blank to finish.\n"
+    )
+    points: list[dict] = []
+    try:
+        while True:
+            entry = input("Known weight in grams (blank to finish): ").strip()
+            if not entry:
+                break
+            try:
+                grams = float(entry)
+            except ValueError:
+                print("  not a number, try again")
+                continue
+            input(f"  Rest {grams:g} g on the sensor, then press Enter to measure...")
+            point = calibration_point(grams, _sample_force(reader, args.seconds))
+            print(
+                f"  raw mean={point['raw_mean']} std={point['raw_std']} "
+                f"n={point['n']}  ({point['newtons']} N)"
+            )
+            marker_outlet.push_sample(
+                [f"calibration grams={grams:g} raw={point['raw_mean']}"], local_clock()
+            )
+            points.append(point)
+    finally:
+        reader.stop()
+
+    if not points:
+        print("No points recorded; nothing saved.")
+        return 0
+
+    store.data["calibrations"].append({"time": _now_iso(), "points": points})
+    store.save()
+    print(f"\nSaved calibration with {len(points)} point(s) to {store.path}")
     return 0
 
 
@@ -1402,6 +1659,10 @@ def main() -> int:
         help=f"FSR press-detection threshold (default {DEFAULT_THRESHOLD})",
     )
     exp.add_argument("--experimenter", default=None, help="Experimenter name (logged)")
+    exp.add_argument(
+        "--no-train", action="store_true",
+        help="Skip the training sequence for this launch",
+    )
     # Study structure — hard-coded defaults, overridable but rarely needed. Only
     # used when a participant is first created; afterwards the stored design wins.
     exp.add_argument(
@@ -1431,6 +1692,24 @@ def main() -> int:
         help=f"FSR press-detection threshold (default {DEFAULT_THRESHOLD})",
     )
     train.set_defaults(func=cmd_train)
+
+    cal = sub.add_parser("calibrate", help="Record force-sensor calibration points")
+    cal.add_argument("participant", type=int, help="Participant number (-> data/NNN)")
+    cal.add_argument(
+        "--port", default=DEFAULT_PORT, help=f"Serial port (default {DEFAULT_PORT})"
+    )
+    cal.add_argument(
+        "--threshold", type=float, default=DEFAULT_THRESHOLD,
+        help=argparse.SUPPRESS,  # unused during calibration; kept for SerialReader
+    )
+    cal.add_argument(
+        "--audio-device", default=None, help=argparse.SUPPRESS,  # unused
+    )
+    cal.add_argument(
+        "--seconds", type=float, default=3.0,
+        help="Seconds to average the reading per weight (default 3.0)",
+    )
+    cal.set_defaults(func=cmd_calibrate)
 
     args = parser.parse_args()
     if args.command == "audio-devices":
