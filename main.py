@@ -24,8 +24,9 @@ Each block modulates a single stimulus dimension:
 The experiment runs both tasks (one fully, then the other); task order is
 counterbalanced per participant and training uses the first task's modality.
 
-LSL streams (same schema as duino_bridge_minimal.py):
-    FSR_force  float32  ~830 Hz continuous force
+LSL streams (same schema as duino_bridge_minimal.py; both declared at
+IRREGULAR_RATE with explicit per-sample timestamps — see _synced_info):
+    FSR_force  float32  continuous force, ~830 Hz (nominal; see SAMPLE_RATE)
     Markers    string   irregular-rate event markers
 
 Marker vocabulary (space-separated "event key=value ..."; every trial-level
@@ -842,12 +843,35 @@ def run_block(
 # ── LSL ────────────────────────────────────────────────────────────────────────
 
 
+def _synced_info(
+    name: str, stype: str, n_channels: int, srate: float, fmt: str, source_id: str
+) -> StreamInfo:
+    """StreamInfo declaring that every sample carries an explicit timestamp.
+
+    Without this block MNELAB's read_native_xdf() routes the stream through its
+    "legacy robust measured-clock segments" recovery, which rewrote our FSR
+    timeline by up to 150 ms while leaving the marker stream on raw timestamps —
+    making markers appear a few samples behind the force trace. Declaring the
+    same v2 metadata the Xtrodes outlets use marks our per-sample local_clock()
+    timestamps as authoritative, so no correction is applied.
+    """
+    info = StreamInfo(name, stype, n_channels, srate, fmt, source_id)
+    sync = info.desc().append_child("synchronization")
+    sync.append_child_value("timestamp_model_version", "2")
+    sync.append_child_value("timestamp_semantics", "explicit_per_sample")
+    sync.append_child_value("timestamp_interpolation", "uniform_between_buffer_endpoints")
+    return info
+
+
 def create_outlets() -> tuple[StreamOutlet, StreamOutlet]:
+    # FSR is declared IRREGULAR_RATE (not SAMPLE_RATE) so importers honour the
+    # per-sample local_clock() timestamps instead of dejittering to a nominal
+    # 830 Hz grid. SAMPLE_RATE is kept only as provenance in config_snapshot().
     fsr = StreamOutlet(
-        StreamInfo("FSR_force", "FSR", 1, SAMPLE_RATE, "float32", SOURCE_ID_FSR)
+        _synced_info("FSR_force", "FSR", 1, IRREGULAR_RATE, "float32", SOURCE_ID_FSR)
     )
     markers = StreamOutlet(
-        StreamInfo("Markers", "Markers", 1, IRREGULAR_RATE, "string", SOURCE_ID_MARKERS)
+        _synced_info("Markers", "Markers", 1, IRREGULAR_RATE, "string", SOURCE_ID_MARKERS)
     )
     return fsr, markers
 
