@@ -112,8 +112,8 @@ RELEASE_RATIO = 0.5  # Release detected below RELEASE_RATIO*threshold (hysteresi
 GRAVITY = 9.80665  # m/s^2, for grams -> Newtons in force calibration
 
 CUE_DURATION_S = 0.300  # Cue symbol display time
-ITI_MIN_S = 2.5  # Inter-trial interval (fixation) bounds
-ITI_MAX_S = 4.5
+ITI_MIN_S = 0.5  # Inter-trial interval (fixation) bounds
+ITI_MAX_S = 2.0
 RESPONSE_TIMEOUT_S = 4.0  # Max wait for a press after cue onset
 
 # Participants are asked to wait 1-2 s after the cue before pressing; responses
@@ -155,6 +155,7 @@ HOLD_SECONDS = 1.5  # Continuous FSR press needed to advance (hold-to-continue)
 HOLD_PROMPT = "Press and hold the surface to continue."
 END_OF_RUN_PAUSE_S = 1.0  # Blank pause after a run, before the break screen
 BETWEEN_RUN_LINES = ["Take a short break."]
+RESUME_LINES = ["Welcome back.", "", "We will continue where you left off."]
 
 # LSL source ids — stored per session so recordings can be matched to sessions.
 SOURCE_ID_FSR = "fsr_arduino"
@@ -645,6 +646,13 @@ def wait(duration_s: float, display: Display) -> bool:
             return False
         time.sleep(0.001)
     return True
+
+
+def wait_for_quit(display: Display) -> None:
+    """Block until the user presses Q/Escape (or closes the window)."""
+    while not display.quit:
+        display.pump()
+        time.sleep(0.01)
 
 
 def wait_for_press(
@@ -1183,8 +1191,10 @@ def run_experiment_loop(
     while not display.quit:
         task = store.next_task()
         if task is None:
-            display.show_message(["Experiment complete.", "", "Thank you!"])
-            wait(3.0, display)
+            display.show_message(
+                ["Experiment complete.", "", "Thank you!", "", "Press Q to exit."]
+            )
+            wait_for_quit(display)
             break
         modality = Modality(task)
 
@@ -1300,12 +1310,20 @@ def cmd_experiment(args: argparse.Namespace) -> int:
             # quit during training stops here and leaves it unmarked, so it
             # resumes next time.
             proceed = True
+            trained_now = False
             if not args.no_train and not store.data.get("training_completed_at"):
+                trained_now = True
                 if run_training(first_modality, cue_map, reader, display, marker_outlet):
                     store.data["training_completed_at"] = _now_iso()
                     store.save()
                 else:
                     proceed = False  # user quit during training
+
+            # When we did not just train (resuming, or --no-train), show a resume
+            # screen gated by a hold before dropping into the next block.
+            if proceed and not trained_now and not display.quit:
+                if not wait_for_hold(reader, display, RESUME_LINES):
+                    proceed = False
 
             if proceed and not display.quit:
                 run_experiment_loop(

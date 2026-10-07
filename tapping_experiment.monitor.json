@@ -1,0 +1,102 @@
+{
+  "$schema": "tools/lsl_monitor/schemas/lsl-monitor.schema.json",
+  "window": {
+    "title": "Tapping / sEMG experiment monitor",
+    "history_seconds": 10,
+    "refresh_hz": 20,
+    "columns": 2,
+    "inactive_after_seconds": 10,
+    "max_points_per_channel": 100000
+  },
+  "streams": [
+    {
+      "id": "fsr",
+      "match": {
+        "name": "FSR_force",
+        "type": "FSR"
+      },
+      "channels": [
+        {
+          "index": 0,
+          "label": "Force",
+          "color": "#f59e0b"
+        }
+      ],
+      "views": [
+        {
+          "type": "traces",
+          "title": "FSR force",
+          "channels": [0],
+          "alignment": "overlay",
+          "layout": {
+            "x": 0,
+            "y": 0,
+            "width": 0.65,
+            "height": 0.6
+          }
+        },
+        {
+          "type": "psd",
+          "title": "FSR power spectrum",
+          "channels": [0],
+          "fft_size": 1024,
+          "frequency_range": [0, 50],
+          "layout": {
+            "x": 0,
+            "y": 0.6,
+            "width": 0.65,
+            "height": 0.4
+          }
+        },
+        {
+          "type": "alive",
+          "title": "FSR stream health",
+          "layout": {
+            "x": 0.65,
+            "y": 0,
+            "width": 0.35,
+            "height": 0.3
+          }
+        }
+      ]
+    },
+    {
+      "id": "markers",
+      "match": {
+        "name": "Markers",
+        "type": "Markers"
+      },
+      "channels": [
+        {
+          "index": 0,
+          "label": "Event"
+        }
+      ],
+      "views": [
+        {
+          "type": "markers",
+          "title": "Experiment markers",
+          "channels": [0],
+          "marker_seconds": 60,
+          "marker_limit": 100,
+          "layout": {
+            "x": 0.65,
+            "y": 0.3,
+            "width": 0.35,
+            "height": 0.55
+          }
+        },
+        {
+          "type": "alive",
+          "title": "Marker stream health",
+          "layout": {
+            "x": 0.65,
+            "y": 0.85,
+            "width": 0.35,
+            "height": 0.15
+          }
+        }
+      ]
+    }
+  ]
+}
