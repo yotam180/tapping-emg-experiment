@@ -1,0 +1,122 @@
+{
+  "$schema": "../schemas/lsl-monitor.schema.json",
+  "window": {
+    "title": "Recording signal monitor",
+    "history_seconds": 10,
+    "refresh_hz": 20,
+    "columns": 2,
+    "inactive_after_seconds": 2,
+    "max_points_per_channel": 100000
+  },
+  "streams": [
+    {
+      "id": "emg",
+      "match": {
+        "identity": "EMG",
+        "type": "EMG"
+      },
+      "channels": [
+        {
+          "index": 0,
+          "label": "Left",
+          "color": "#5eead4"
+        },
+        {
+          "index": 1,
+          "label": "Right",
+          "color": "#60a5fa"
+        },
+        {
+          "index": 2,
+          "label": "Trigger",
+          "color": "#f472b6"
+        }
+      ],
+      "views": [
+        {
+          "type": "traces",
+          "title": "EMG traces",
+          "channels": [0, 1, 2],
+          "alignment": "stacked",
+          "layout": {
+            "x": 0,
+            "y": 0,
+            "width": 0.65,
+            "height": 0.5
+          }
+        },
+        {
+          "type": "plane_2d",
+          "title": "Left versus right",
+          "channels": [0, 1],
+          "layout": {
+            "x": 0.65,
+            "y": 0,
+            "width": 0.35,
+            "height": 0.5
+          }
+        },
+        {
+          "type": "psd",
+          "title": "EMG power spectrum",
+          "channels": [0, 1],
+          "fft_size": 2048,
+          "frequency_range": [0, 250],
+          "layout": {
+            "x": 0,
+            "y": 0.5,
+            "width": 0.4,
+            "height": 0.5
+          }
+        },
+        {
+          "type": "alive",
+          "title": "EMG stream health",
+          "layout": {
+            "x": 0.65,
+            "y": 0.5,
+            "width": 0.35,
+            "height": 0.25
+          }
+        }
+      ]
+    },
+    {
+      "id": "markers",
+      "match": {
+        "identity": "Markers",
+        "type": "Markers"
+      },
+      "channels": [
+        {
+          "index": 0,
+          "label": "Event"
+        }
+      ],
+      "views": [
+        {
+          "type": "markers",
+          "title": "Event roll",
+          "channels": [0],
+          "marker_seconds": 30,
+          "layout": {
+            "x": 0.4,
+            "y": 0.5,
+            "width": 0.25,
+            "height": 0.5
+          }
+        },
+        {
+          "type": "alive",
+          "title": "Marker stream health",
+          "layout": {
+            "x": 0.65,
+            "y": 0.75,
+            "width": 0.35,
+            "height": 0.25
+          }
+        }
+      ]
+    }
+  ]
+}
